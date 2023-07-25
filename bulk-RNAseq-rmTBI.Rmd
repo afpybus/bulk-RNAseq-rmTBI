@@ -1,5 +1,5 @@
 ---
-title: "Bulk RNA sequencing for temporal profiling in reptitive mild traumatic brain injury"
+title: "Bulk RNA sequencing for temporal profiling in repetitive mild traumatic brain injury"
 author: "Alyssa Pybus"
 output: github_document
 ---

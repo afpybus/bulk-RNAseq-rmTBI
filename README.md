@@ -1,4 +1,4 @@
-Bulk RNA sequencing for temporal profiling in reptitive mild traumatic
+Bulk RNA sequencing for temporal profiling in repetitive mild traumatic
 brain injury
 ================
 Alyssa Pybus
