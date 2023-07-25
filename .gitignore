@@ -16,7 +16,6 @@
 *.xlsx
 *.csv
 *.pdf
-*.png
 *.rda
 *.rds
 CellTypeFET-main/
