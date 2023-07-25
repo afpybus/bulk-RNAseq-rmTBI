@@ -1,38 +1,25 @@
 ---
-title: "Single Nuclear RNAseq for Gamma Audiovisual Stimulated Mice"
+title: "Bulk RNA sequencing for temporal profiling in reptitive mild traumatic brain injury"
 author: "Alyssa Pybus"
-date: "2022-2023"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(warning=FALSE, fig.align="center")
 ```
 
-Single nuclear RNA sequencing was conducted using tissue lysate from the right visual cortex of male, wild-type mice of three stimulation groups: no stimulation control, audiovisual flicker at 20Hz, and audiovisual flicker at 40Hz. Analysis was conducted to analyze the cell type-specific changes in gene expression after non-invasive flicker. This project overview will show the steps involved in data pre-processing, mapping cells to a reference mouse cortical atlas, generation of pseudo-bulk data, differential expression analysis, gene set enrichment analysis, and data visualization.
 
-This project is organized into two separate scripts: one for data pre-processing/wrangling (Wrangle.R) and one for the main analysis (snRNAseq_Flicker.R). To recreate the figures used in this experiment, download the count matrices from the Gene Expression Omnibus (GEO) under series tag GSE226822. Our analysis relies on the Azimuth reference mapping web app and the PANTHER Gene Ontology web app.
+This project is organized into four separate scripts: data pre-processing/wrangling (Wrangle.R), a function to run analysis results on a given subset of the data (Sample Subset.R), the main analysis (22131-02 Analysis.R), and weighted gene coexpression network analysis (WGCNA.R). 
 
 
 ## Wrangle.R
 
-Before running Wrangle.R :
-
-1. Upload fastq files to 10X Genomics Cloud Analysis: https://cloud.10xgenomics.com/cloud-analysis
-2. Send fastq for analysis in Cell Ranger to create count matrix file (Feature / cell matrix, filtered, TAR file). I used these settings: Cell Ranger Count v7.0.1, mm10 2020-A, include introns, skip BAM
-3. Download the TAR file using the Cloud Command Line Interface (CLI). The files used for this analysis can be found on the GEO under series tag GSE226822.
-4. Extract the files from the .tar.gz file using untar() in R (see commands below) or any other method 
-5. Put the barcodes.tsv, genes.tsv (or features.tsv), and matrix.mtx witin the same directory/folder
-
-
 Wrangle.R produces the following outputs for later use in the analysis:
 
-- Creates and saves filtered Seurat Objects of each sample from 10x Genomics count matrices
-- (You will run the first section then navigate to Azimuth web app for refernce mapping)
-- Adds Azimuth reference mapping results to each Seurat Object and saves a new copy
-- Saves GSVA gene sets as R data file for later access during analysis (skip if not doing GSVA)
-- Creates and saves pseudo-bulk aggregated count matrices for each sample then each cell type
-- Saves results of DESeq2 analysis on cell type pseudo-bulk data for 40Hz vs 20Hz and No Flicker
+- R data set of the filtered raw count matrix, metadata in matching order, and a data frame of the gene names and IDs
+- R data set of sample protein values matrix, index of analyte columns within the protein data frame, greek character labels, and palettes for time and injury number
+- R data get of gene sets for use in GSVA
+- R data set of normalized, variance-stabilization gene expression
 
 
 ### Set-up
@@ -42,443 +29,227 @@ Clear out global environment, set working directory to current file location (wh
 ```{r setup_wrangle}
 rm(list=ls())
 setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
-pacman::p_load(Seurat,tidyverse,rio,DESeq2,readxl,GSVA)
+pacman::p_load(tidyverse)
 ```
 
-### "Un-TAR" the count matrices from GEO
+### Transcript data preparation
 
-When you download the count matrices, save them to your project folder and update the file location below as needed. I used subfolders within the main repo entitled "10x Genomics Cell Ranger Output/Feature Matrices Filtered TAR" with a separate subfolder for each sample number (i.e. "S1", "S2", etc.). The extracted matrices then get stored in a new directory under the 10x folder named "Count Matrices".
+#### Load the metadata
 
-```{r untar, eval=FALSE}
-## Untar the downloaded count matrix and put all three extracted files in same directory
-sapply(1:12,function(x){untar(paste0("10x Genomics Cell Ranger Output/Feature Matrices Filtered TAR/S",x,"/filtered_feature_bc_matrix.tar.gz"),
-                              exdir = paste0("10X Genomics Cell Ranger Output/Count Matrices/S",x))}) 
+The metadata will later be sorted to match the order of samples from the data, so this variable has the suffix .us for "unsorted".
+```{r wrangle_metadata_load}
+# load in experiment data and metadata
+metadata.us = readxl::read_excel("Data/22131-02 metadata.xlsx") %>%
+  mutate(Injury = factor(Injury,levels=c("Sham","1xCHI","pre-3xCHI","3xCHI","pre-5xCHI","5xCHI")))
+
+glimpse(metadata.us)
 ```
 
+#### Load in and filter the count data
 
-### Create and save Seurat objects for each sample to input to Azimuth
+We use filter criteria to match recommendations for use in Weighted Gene Co-expression Network Analysis (WGCNA): keep genes where at least 90% have a raw count higher than 10.
 
-Create Seurat objects for use in the Azimuth reference mapping application as well as downstream analysis. Remove cells/nuclei with too counts (possibly droplets), with too many counts (possibly multiple cells), or with too much mitochondrial RNA (possibly dead/dying) as a standard quality control step. Normalize the data (normalize features for each cell by total expression, multiply by default scale factor of 1000, and log transform) and select for the 2000 most highly variable features for downstream analysis.
+Reference: <https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/faq.html> 
 
-Read more about Seurat: <https://satijalab.org/seurat/>
+```{r wrangle_data_load}
+count.in = rio::import("Data/22131-02-gene-count-all.csv")
+gene.df.uf = count.in[,2:3]  # unfiltered gene names (non-unique) and EnsemblIDs (unique)
+count.uf = count.in[,4:42]  # unfiltered gene counts
+colnames(count.uf) = metadata.us$Sample
+rownames(count.uf) = gene.df.uf$EnsemblID
 
-```{r seurat_objects, eval=FALSE}
-dir.create("Seurat Objects",showWarnings = FALSE)
-lapply(1:12,function(i){
-  cond = case_when(i %in% 1:4 ~ "Control",i %in% 5:8 ~ "20Hz",i %in% 9:12 ~ "40Hz")
-  count.matrix = Read10X(data.dir = paste0("10x Genomics Cell Ranger Output/Count Matrices/S",i))
-  data.so = CreateSeuratObject(counts = count.matrix, project = "CART") %>%
-    AddMetaData(metadata = paste0("Sample",i), col.name = "Sample") %>%
-    AddMetaData(metadata = cond, col.name = "Stim")
-  
-  # Filter out cells with too few (possibly droplets) or too many counts (possibly multiple cells) and cells with too much mito RNA
-  data.so[["percent.mt"]] <- PercentageFeatureSet(data.so, pattern = "^mt-") # QC: mitochondrial RNA
-  data.so <- subset(data.so, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt < 20)
-  
-  data.so = NormalizeData(data.so)
-  data.so = FindVariableFeatures(data.so, selection.method = "vst", nfeatures = 2000)
-  saveRDS(data.so,file=paste0("Seurat Objects/S",i,".rds"))
-})
-```
+# filter criteria as recommended on WGCNA FAQ (genes where 90% of samples have count >10)
+keepInd=which(rowSums(count.uf>10) > {ncol(count.uf)*.9})
+count.us = count.uf[keepInd,]   # unsorted columns (samples), filtered genes (rows)
+gene.df = gene.df.uf[keepInd,]  # filtered genes (rows)
 
-### Azimuth reference mapping
+# sort by AbsoluteTime
+metadata = dplyr::arrange(metadata.us,AbsoluteTime)  # sort sample metadata by ascending time point since first injury
+sort_ind = match(metadata$Sample,metadata.us$Sample)
+count <- count.us[,sort_ind]  # sort count matrix columns by ascending time point since first injury (match metadata tibble)
 
-At this point, navigate to Azimuth: <https://azimuth.hubmapconsortium.org/>
+save(count,metadata,gene.df,file="R Data/genecounts.rda")  # save to access later
 
-Use this link for mapping to mouse motor cortex reference: <https://app.azimuth.hubmapconsortium.org/app/mouse-motorcortex>
-
-Upload the Seurat objects one sample at a time and download the resulting cell type predictions and UMAP projections. In the next step, we load each Seurat object, add in the Azimuth labels as metadata, and attach the UMAP projection onto reference data.
-
-```{r azimuth, eval=FALSE}
-# Add Azimuth data to each sample and save new Seurat Object 
-for(i in ind){
-  sample.so = readRDS(file=paste0("Seurat Objects/S",i,".rds"))
-  az_pred = import(paste0("Azimuth/S",i,"/azimuth_pred.tsv"))
-  az_umap_out = import(paste0("Azimuth/S",i,"/azimuth_umap.Rds"))
-  az_out = list(umap=az_umap_out,pred.df=az_pred)
-  saveRDS(az_out,paste0("Azimuth/S",i,"/az_out.rds"))
-  
-  # Some cell type labels were combined due to very low numbers and total absence in some samples
-  az_pred$predicted.subclass[az_pred$predicted.subclass=="L6 CT"] = "L6 CT/L6b"
-  az_pred$predicted.subclass[az_pred$predicted.subclass=="L6b"] = "L6 CT/L6b"
-  az_pred$predicted.subclass[az_pred$predicted.subclass=="Sst Chodl"] = "Sst"
-  az_pred$predicted.subclass[az_pred$predicted.subclass=="L6 IT Car3"] = "L6 IT"
-  az_pred$predicted.subclass[az_pred$predicted.subclass=="Sncg"] = "Vip/Sncg"
-  az_pred$predicted.subclass[az_pred$predicted.subclass=="Vip"] = "Vip/Sncg"
-  
-  sample.so <- sample.so %>%
-    AddMetaData(metadata = az_pred$predicted.subclass, col.name = "Subclass") %>%
-    AddMetaData(metadata = az_pred$predicted.class, col.name = "Class") %>%
-    AddMetaData(metadata = az_pred$predicted.cluster, col.name = "Cluster") %>%
-    AddAzimuthResults(paste0("Azimuth/S",i,"/az_out.rds"))
-  
-  saveRDS(sample.so,file=paste0("Seurat Objects/S",i,"_az.rds"))
-  rm(sample.so)
-}
-
-cell_types=c("Micro-PVM","L2/3 IT","L6 IT","Astro","Sst","VLMC","Oligo","OPC","L5 IT","Meis2",
-             "L5 ET","L5/6 NP","Pvalb","Endo","Lamp5","Peri","Vip/Sncg","L6 CT/L6b")
-saveRDS(cell_types,paste0("R Data/cell_types.rds"))  # save this for later
-```
-
-
-### Assemble pseudo-bulk data
-
-Numerous recent publications have cautioned against the approach of conducting differential expression analysis between biological samples using single cell data. The current preferred approach is to aggregate gene expression data among all cells of the same clustered cell type to create a "pseudo-bulk" RNAseq count matrix for each cell type. Following generation of pseudo-bulk data, we can then follow standard steps of bulk RNAseq analysis including differential expression analysis using DESeq2.
-
-
-```{r pb, eval=FALSE}
-## Create Pseudobulk CSV files for each Sample, Aggregate Counts #####
-dir.create("Pseudobulk Data/Aggregated Counts by Sample",recursive = TRUE,showWarnings=FALSE)
-pb_samples = lapply(1:12,function(i){
-  sample.so = readRDS(paste0("Seurat Objects/S",i,"_az.rds"))
-  Idents(sample.so) = "Subclass"
-  pb = AggregateExpression(sample.so,slot="counts")[[1]]  # sums up gene counts in all cells by cell type 
-  export(pb,paste0("Pseudobulk Data/Aggregated Counts by Sample/pb_S",i,".csv"),row.names=TRUE)  # save count matrix as a csv for later access
-  return(as.data.frame(pb))
-  })
-names(pb_samples) = str_c("S",1:12)
-
-# Using list of sample pseudo-bulk (pb) matrices, create a matrix for each separate cell type
-cell_types = readRDS("R Data/cell_types.rds")
-dir.create("Pseudobulk Data/Aggregated Counts by Cell Type",recursive = TRUE,showWarnings=FALSE)
-pb_ct = lapply(cell_types,function(ct){
-  pb = do.call(cbind,lapply(pb_samples,function(x){select(x,ct)}) )
-  colnames(pb)=names(pb_samples) # col names are sample labels
-  rownames(pb)=pb_list[[1]]$V1  # row names are gene names
-  saveRDS(pb,paste0("Pseudobulk Data/Aggregated Counts by Cell Type/pb_",str_replace(ct,pattern = "/",replacement = "-"),".rds"))
-  rio::export(pb,paste0("Pseudobulk Data/Aggregated Counts by Cell Type/pb_",str_replace(ct,pattern = "/",replacement = "-"),".csv"),row.names=TRUE)
-  return(as.data.frame(pb))
-})
-names(pb_ct) = cell_types
-```
-
-
-### Calculate differential expression statistics on pseudo-bulk data using DESeq2
-
-The data set contains two control groups: no stimulation and 20Hz audiovisual flicker stimulation. To account for this, we separate results for each comparison against 40Hz flicker.
-
-```{r pb_de, eval=FALSE}
-## Normalize Pseudobulk data with DESeq2, run and save DESeq2 results by cell type  ###########
-# save results in separate folders for 40Hz vs 20Hz and 40Hz vs No Flicker
-cell_types=readRDS(paste0("R Data/cell_types.rds"))
-metadata=read_xlsx("22131-03 metadata.xlsx") %>%
-  mutate(Frequency = factor(Frequency,levels = c("40Hz","20Hz","None")))
-dir.create("Pseudobulk Data/DESeq2 Results 40 vs 20",recursive = TRUE,showWarnings=FALSE)
-dir.create("Pseudobulk Data/DESeq2 Results 40 vs No Flicker",recursive = TRUE,showWarnings=FALSE)
-
-lapply(1:length(pb_ct),function(i){
-  pb = pb_ct[[i]]
-  ct = names(pb_ct)[i]
-  # DESeq2 Normalization  
-  dds <- DESeqDataSetFromMatrix(countData = pb,
-                                colData = metadata,
-                                design = ~ Frequency)
-  dds <- DESeq(dds)
-  res20v40 <- results(dds, name="Frequency_20Hz_vs_40Hz")
-  resNonev40 <- results(dds, name="Frequency_None_vs_40Hz")
-  
-  export(as.data.frame(res20v40),paste0("Pseudobulk Data/DESeq2 Results 40 vs 20/",
-                                        str_replace(ct,pattern = "/",replacement = "-"),"_all.csv"),row.names=TRUE)
-  export(as.data.frame(resNonev40),paste0("Pseudobulk Data/DESeq2 Results 40 vs No Flicker/",
-                                          str_replace(ct,pattern = "/",replacement = "-"),"_all.csv"),row.names=TRUE)
-}) 
-```
-
-
-## snRNAseq_Flicker.R
-
-Now that our data is prepared for analysis, we turn to snRNAseq_Flicker.R for data exploration and visualization.
-
-### Set-up
-
-As before, we'll clear our global environment (we'll load the files we need whenever we need them), set the file location (if needed), and load necessary packages. You may need to install a few of these since this list is longer than the last one. Additionally, I set up my preferred ggplot theme and set consistent colors for my three experimental groups.
-
-```{r setup_analysis}
-rm(list=ls())
-setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
-pacman::p_load(tidyverse,rio,gplots,cowplot,RColorBrewer,Seurat,ggpubr,heatmap3,WoodLabFunctions,EnhancedVolcano)
-theme_set(theme_cowplot())
-stim_palette= c("#bebebe","#1071b9","#ec242a")  # gray for No Flicker, blue for 20Hz, red for 40Hz
-```
-
-
-### Panel A: UMAP of All Samples from Azimuth Projections
-
-The Azimuth reference mapping web app provides Uniform Manifold Approxmation and Projection (UMAP) coordinates for each given sample which project individual cells into their corresponding location on the reference set UMAP. In this manner, the reference set's UMAP coordinate system remains consistent across each separate experimental sample, and so projections for all samples can logically be combined into one singular projection. We create multiple color-coded figures of the same combined UMAP projection to see trends among cells of each subclass, stimulation group, and class.
-
-```{r panel_A}
-ind=1:12  # index for 12 samples, using in for loop
-umap_all = data.frame()  # create blank data frame which will be filled with UMAP projection data for each sample
-
-# load UMAP projection from each sample to umap_all
-# UMAP projections are created in Azimuth by mapping our query data onto the reference set (primary mouse motor cortex)
-for(i in ind){
-  rm(SO)  # remove last seurat object from environment to limit RAM use
-  SO = readRDS(file=paste0("Seurat Objects/S",i,"_az.rds"))  # load the seurat object for sample number i
-  # save the umap projection coordinates alongside cell type labels, stimulation condition, and sample number
-  umap=SO@reductions$umap.proj@cell.embeddings %>% as.data.frame() %>%
-    cbind(Stim=SO@meta.data$Stim,Class=SO@meta.data$Class,Subclass=SO@meta.data$Subclass,Sample=SO@meta.data$Sample)
-  umap_all = rbind(umap_all,umap)  # add this sample's data to the total data frame
-}
-
-# create a ggplot object with the cell type labels at each cluster centroid, to be added to each other ggplot 
-# DimPlot makes labeling centroids super easy but limits other capabilities, so I switch to ggplot moving forward
-p_labels = DimPlot(SO, reduction = "umap.proj", group.by="Subclass",label = TRUE, repel = TRUE)
-rm(SO)  # remove last seurat object from environment to limit RAM use
-```
-#### UMAP projection by cell subclass
-
-Azimuth assigns a subclass label to each cell based on its nearest homolog in the reference set.
-
-```{r umap_subclass, fig.height=5,fig.width=7}
-# Create a UMAP colored by Subclass (cell type)
-p1=ggplot(data=umap_all,aes_string(x="UMAP_1",y="UMAP_2",color="Subclass")) +
-  geom_point(size=0.2)
-p1$layers[[2]] = p_labels$layers[[2]]
-plot(p1)
-```
-
-#### UMAP projection by stimulation (no flicker, 20Hz, and 40Hz)
-
-This representation by stimulation group shows minimal differences in cell subclass population by stimulation group.
-
-```{r umap_stim, fig.height=5,fig.width=5.5}
-# Create a UMAP colored by Stimulation
-p2=ggplot(data=umap_all %>% arrange(sample(1:nrow(umap_all),nrow(umap_all))),aes_string(x="UMAP_1",y="UMAP_2",color="Stim")) +
-  geom_point(size=0.001,alpha=0.1) + 
-  scale_color_manual(values=c("#1071b9","#ec242a","#bebebe")) +
-  xlab("UMAP1") +
-  ylab("UMAP2")
-p2$layers[[2]] = p_labels$layers[[2]]
-plot(p2)
-```
-
-#### UMAP projection by cell class
-
-
-```{r umap_class, fig.height=5,fig.width=6}
-# Create a UMAP colored by Class (GABA,gluta,non-neuronal)
-p3=ggplot(data=umap_all,aes_string(x="UMAP_1",y="UMAP_2",color="Class")) +
-  geom_point(size=0.2)
-p3$layers[[2]] = p_labels$layers[[2]]
-plot(p3)
-```
-
-
-### Panel B: Number of Pseudo-bulk DE Genes by Cell Type
-
-To see which cell types show the most significant changes between stimulation groups, we count the number of differentially expressed (p<0.05) genes within each comparison by cell type and display these values in a bar plot. Layer 2/3 intratelecephalon-projecting glutamatergic neurons have almost 500 differentially expressed genes when comparing 20Hz and 40Hz flicker stimulation!
-
-```{r panel_B, fig.width=11, fig.height=5}
-cell_types=readRDS(paste0("R Data/cell_types.rds"))
-NumDE = data.frame()
-DEs = list()
-pb_ct_dir = "Pseudobulk Data/DESeq2 Results "
-
-for(i in 1:length(cell_types)){
-  ct = cell_types[i]
-  safe_ct = str_replace(ct,pattern = "/",replacement = "-") # replace incompatible characters
-  DE_20v40 = import(paste0(pb_ct_dir,"40 vs 20/",safe_ct,"_all.csv")) %>%
-    filter(padj < 0.05) %>%
-    mutate(comparison = "20Hz vs 40Hz") %>%
-    mutate(celltype = ct)
-  DE_Nonev40 = import(paste0(pb_ct_dir,"40 vs No Flicker/",safe_ct,"_all.csv")) %>%
-    filter(padj < 0.05) %>%
-    mutate(comparison = "No Flicker vs 40Hz") %>%
-    mutate(celltype = ct)
-  add = data.frame(ct=ct,num20v40=nrow(DE_20v40),numNonev40=nrow(DE_Nonev40))
-  NumDE = rbind(NumDE,add)
-  
-  DEs$new = rbind(DE_20v40,DE_Nonev40)
-  names(DEs)[which(names(DEs)=="new")] = str_replace(ct,pattern = "/",replacement = "-")
-}
-
-# save a csv of all DE genes (padj < 0.05) across all cell types and both comparisons
-DE_all = do.call(rbind,DEs)
-export(DE_all,"Pseudobulk Data/All DE Genes by Cell Type and Comparison.csv")
-
-NumDE = NumDE %>%
-  arrange(desc(`num20v40`),desc(`numNonev40`)) %>%
-  mutate(ct = factor(ct,levels=ct)) %>%
-  gather(key="comparison",value="n",2:3) %>%
-  mutate(comp_group = case_when(
-    comparison == "num20v40" ~ "40Hz vs 20Hz",
-    comparison == "numNonev40" ~ "40Hz vs Light",
-  ))
-
-stim_palette= c("#bebebe","#1071b9","#ec242a")  # gray for No Flicker, blue for 20Hz, red for 40Hz
-
-ggplot(NumDE,aes(x=ct,y=n,fill=comp_group)) +
-  geom_col(position="dodge",width=0.8) +
-  geom_text(aes(label = n), vjust = -0.5,position=position_dodge(width=0.8),size=2.7) +
-  scale_fill_manual(values=c(stim_palette[2],stim_palette[1]),name="Comparison:") + 
-  theme(axis.text.x = element_text(angle=90,hjust=.95,vjust=0.5)) +
-  xlab("Cell Type") +
-  ylab("Differentially Expressed Genes")
-
-```
-
-### Panel C: Volcano plots for cell types of interest
-
-Volcano plots are a classic tool for showing the scope of changes in gene expression across the transcriptome. This plot shows which genes are significantly different between groups (vertical axis, p<0.05) and which show the largest changes (horizontal axis, greater distances from 0). You can tweek the provided code to look at different cell types and pick between comparing with 20Hz or no stimulation control.
-
-```{r panel_C, fig.height=5,fig.width=5.5}
-
-# FIGURE PANEL C: Volcano plots for cell types of interest  #############
-ind = 1:12
-cell_types=readRDS(paste0("R Data/cell_types.rds"))
-
-# Define colors to use in volcano plots by stimulation group
-volcano_palette = c(`None`="#bebebe",        # grey
-                    `No Flicker`="#bebebe",  # grey
-                    `20Hz`="#1071b9",        # blue
-                    `40Hz`="#ec242a",        # red
-                    `ns`="black")
-
-comp_group = "20Hz"
-# comp_group = "None"  # set this according to which comparison you're interested in
-cell_types_subset = "Micro-PVM"  # just look at microglia / perivascular macrophage for this run
-# cell_types_subset = c("Micro-PVM","Astro","L2/3 IT")   # Focusing analysis on three cell types of interest
-dir.create(paste0("Figures/Panel C - Pseudobulk Volcanos"),recursive = TRUE, showWarnings = FALSE)
-
-
-for(ct in cell_types_subset){
-  if(comp_group == "None"){comp_label = "No Flicker"; folder="No Flicker/"}
-  if(comp_group == "20Hz"){comp_label = comp_group; folder="20/"}
-  ct_comp=import(paste0("Pseudobulk Data/DESeq2 Results 40 vs ",folder,str_replace(ct,pattern = "/",replacement = "-"),"_all.csv")) %>%
-  drop_na() %>%
-  dplyr::rename(gene=V1) %>%
-  mutate(logp = -log(padj,10)) %>%
-  mutate(elevated = case_when(
-    log2FoldChange < 0 & padj < 0.05 ~ "40Hz",
-    log2FoldChange > 0 & padj < 0.05 ~ comp_label,
-    TRUE ~ "ns"
-  )) %>%
-  mutate(labels = case_when(
-    elevated != "ns" ~ gene,
-    TRUE ~ ""
-  )) %>%
-  mutate(flip_FC = -log2FoldChange) # for flipping axis to show 40Hz on right side
-
-  p_title = ct
-  if(ct == "Astro"){p_title = "Astrocytes"}
-  if(ct == "Micro-PVM"){p_title = "Microglia / PVM"}
-  if(ct == "L2/3 IT"){p_title = "L2/3 IT Neurons"}
-
-p1=ggscatter(data=ct_comp,x="flip_FC",y="logp",title = p_title,
-          ylab="p-value (-log10)",xlab="Fold Change (log2)",color="elevated",
-          repel = T,label="labels") +
-  theme(plot.title = element_text(hjust=0.5,size=20,face="bold"))
-p2=ggplot() +
-  geom_hline(yintercept = -log(0.05,10),linetype="dashed",color="gray") +
-  annotate("text",y={-0.03*range(ct_comp$logp)[2]}-log(0.05,10),x=0.95*min(ct_comp$flip_FC,na.rm = TRUE),label="p=0.05",color="gray")
-p1$layers = c(p2$layers, p1$layers) 
-p1$layers[[4]]$aes_params$size=3
-p1$layers[[4]]$aes_params$fontface="italic"
-
-print(ggpar(p1,palette = volcano_palette))
-
-}
+glimpse(count)
+glimpse(metadata)
+glimpse(gene.df)
 ```
 
 
 
-### Panel D and E: Gene Ontology on Pseudobulk by Cell Type
+### Protein data preparation
 
-#### Prep gene lists for GO PANTHER
+#### Load the protein data, filter, and subtract background
 
-We use the PANTHER Gene Ontology web app for gene set enrichment analysis. To facilitate this analysis, we create text files of all genes that are significantly elevated in each experimental group for each comparison (40 vs 20, 40 vs no flicker). 
+Load in the protein data, filter to just female frontal cortex samples (bulk RNAseq was conducted on female sematomotor cortex, adjacent to the frontal cortex where proteins were measured in the same animals), and subtract background values.
 
-Conduct GO analysis online via PANTHER 17.0: <http://pantherdb.org/webservices/go/overrep.jsp>
+```{r wrangle_protein_load}
+# load protein data
+df_in <- readxl::read_excel("Data/DoD TBI Acute All.xlsx") %>%
+  dplyr::arrange(Region,AbsoluteTime) %>%
+  dplyr::filter(Sex == "F") %>%  # Female samples only (RNAseq was only on female samples)
+  dplyr::filter(Region == "FC")
 
-```{r genelists_go, eval=FALSE}
-# create .txt files of gene query and background sets for easy upload to GO PANTHER web app
-ind=1:12
-cell_types=readRDS(paste0("R Data/cell_types.rds"))
-cell_types_subset = c("Micro-PVM","Astro","L2/3 IT")
-dir.create(paste0("Pseudobulk Data/Gene Ontology 40 vs 20"),recursive = TRUE, showWarnings = FALSE)
-dir.create(paste0("Pseudobulk Data/Gene Ontology 40 vs No Flicker"),recursive = TRUE, showWarnings = FALSE)
+# define the analytes to treat as numeric variables by setting first and last in range
+first_analyte="GFAP"
+last_analyte="TNF-a"
+analyte_range={which(colnames(df_in)==first_analyte)}:{which(colnames(df_in)==last_analyte)}
 
-for(i in 1:length(cell_types_subset)){
-  ct = cell_types_subset[i]
-  safe_ct = str_replace(ct,pattern = "/",replacement = "-")
-  
-  All_20v40 = import(paste0("Pseudobulk Data/DESeq2 Results 40 vs 20/",safe_ct,"_all.csv")) %>%
-    drop_na()
-  # Gene Background
-  export(data.frame(gene=All_20v40$V1),paste0("Pseudobulk Data/Gene Ontology 40 vs 20/",safe_ct," Background.txt"),col.names=FALSE)
-  # DE Genes
-  DE_20v40 = filter(All_20v40,padj<0.05 & log2FoldChange < 0)
-  export(data.frame(gene=DE_20v40$V1),paste0("Pseudobulk Data/Gene Ontology 40 vs 20/",safe_ct," Significantly Elevated in 40Hz.txt"),col.names=FALSE)
-  
-  DE_Nonev40 = import(paste0("Pseudobulk Data/DESeq2 Results 40 vs No Flicker/",safe_ct,"_all.csv")) %>%
-    drop_na()
-  # Gene Background
-  export(data.frame(gene=All_20v40$V1),paste0("Pseudobulk Data/Gene Ontology 40 vs No Flicker/",safe_ct," Background.txt"),col.names=FALSE)
-  # DE Genes
-  DE_20v40 = filter(All_20v40,padj<0.05 & log2FoldChange < 0)
-  export(data.frame(gene=DE_20v40$V1),paste0("Pseudobulk Data/Gene Ontology 40 vs No Flicker/",safe_ct," Significantly Elevated in 40Hz.txt"),col.names=FALSE)
-}
+#create array of average background for each analyte
+df_b <- df_in %>%
+  filter(Sample == "background") %>%
+  dplyr::select(all_of(analyte_range)) %>%
+  colMeans()
 
+#create data frame of sample data
+df_samples <- df_in %>%
+  dplyr::filter(Sample != "background") %>%
+  dplyr::filter(Sample %in% metadata$Sample) %>%
+  mutate(Sample = as.numeric(Sample))
+
+# Subtract background, set negative values to zero
+df_samples[,analyte_range] <- sweep(df_samples[,analyte_range],2,df_b)
+df_samples[df_samples<0] <- 0 # analytes below background set to zero
+
+glimpse(df_samples)
 ```
 
-#### Gene set enrichment analysis visualization
-
-After conducting GSEA via Panther GO, you can export your results to a txt file, save to a project folder, and visualize in a bar plot. 
-
-```{r gsea, fig.height=3.5, fig.width=12, message=FALSE}
-# FIGURE PANEL D/E: Gene Ontology on Pseudobulk by Cell Type: Bar Graphs for Enriched Processes ############
-GO_results_microglia = read_tsv("Pseudobulk Data/Gene Ontology 40 vs 20/Micro-PVM GO Results.txt",skip = 11) 
-colnames(GO_results_microglia) = c("GO_biological_process",
-                                   "set_n_ref",
-                                   "set_n_query_actual",
-                                   "set_n_query_expected",
-                                   "over_under",
-                                   "fold_enrichment",
-                                   "fishers_p",
-                                   "padj_fdr")
-GO_results_microglia_filtered = GO_results_microglia %>%
-  filter(padj_fdr < 0.25) %>%
-  mutate(fold_enrichment = as.numeric(fold_enrichment)) %>%
-  arrange(fold_enrichment) %>%
-  mutate(GO_biological_process = factor(GO_biological_process,levels=GO_biological_process)) %>%
-  mutate(logp = -log(padj_fdr,10))
 
 
-ggplot(GO_results_microglia_filtered,aes(x=GO_biological_process,y=fold_enrichment,
-                                         label=str_c(signif(fishers_p,1)," / ",signif(padj_fdr,1)),fill=logp)) +
-  geom_col(color="black") +
-  coord_flip() +
-  geom_text(hjust=-0.1) +
-  expand_limits(y=23) +
-  xlab("") +
-  ylab("Fold Enrichment") +
-  ggtitle("Upregulated Biological Processes in Microglia / PVM") +
-  theme(plot.title = element_text(face="bold",hjust=0.5,size=20)) +
-  scale_fill_gradient(low="white",high="purple",name="FDR p (-log10)") +
-  annotate("text",x=3,y=0.9*max(GO_results_microglia_filtered$fold_enrichment),label="Fisher's p / FDR-adjusted p")
+#### Create unicode labels for greek characters
 
+To enable the use of greek characters in figures (created in the main analysis script) without complicating the column names of our sample data frame, create a "greekversion" array to store unicode labels.
 
+```{r greek}
+# create unicode labels for greek characters
+greek = colnames(df_samples)
+greek[which(greek=="AB40")] = "A\u03b240"
+greek[which(greek=="AB42")] = "A\u03b242"
+greek[which(greek=="AB42/40")] = "A\u03b242/40"
+greek[which(greek=="tTau")] = "Total Tau"
+greek[which(greek=="pTau")] = "Phospho-Tau T181"
+greek[which(greek=="IFN-g")] = "IFN-\u03b3"
+greek[which(greek=="IL-1a")] = "IL-1\u03b1"
+greek[which(greek=="IL-1b")] = "IL-1\u03b2"
+greek[which(greek=="MIP-1a")] = "MIP-1\u03b1"
+greek[which(greek=="MIP-1b")] = "MIP-1\u03b2"
+greek[which(greek=="TNF-a")] = "TNF-\u03b1"
 
+greek[analyte_range]
 ```
 
-#### Alternative visualization: dot plot
+#### Create color bars for use in figures
 
-```{r gsea_alt, fig.height=3.5, fig.width=12}
+For analyses that maintain the sample order used in df_samples, we create a color bar for injury number and time point after injury. These will be used to denote experimental groups in bar plots, heatmaps, and other visualizations.
 
-ggplot(GO_results_microglia_filtered,aes(x=GO_biological_process,y=fold_enrichment, size=set_n_query_actual,
-                                         label=str_c(signif(fishers_p,1)," / ",signif(padj_fdr,1)),color=logp)) +
-  geom_point() +
-  coord_flip() +
-  geom_text(hjust=-0.2,size=4) +
-  expand_limits(y=23) +
-  xlab("") +
-  ylab("Fold Enrichment") +
-  ggtitle("Upregulated Biological Processes in Microglia / PVM") +
-  theme(plot.title = element_text(face="bold",hjust=0.5,size=20)) +
-  scale_color_gradient(low="blue",high="red",name="FDR p (-log10)") +
-  scale_size(name="Enriched Genes") +
-  annotate("text",x=3,y=0.9*max(GO_results_microglia_filtered$fold_enrichment),label="Fisher's p / FDR-adjusted p")
+```{r colorbars, fig.height=3.5, fig.width=5}
+# create color bars for use in figures
+InjPalette = rev(RColorBrewer::brewer.pal(6,"Spectral"))
+TimePalette = RColorBrewer::brewer.pal(4,"Purples")
+
+InjColors = case_when(
+  df_samples$Injury=="Sham" ~ InjPalette[1],
+  df_samples$Injury== "1xCHI" ~ InjPalette[2],
+  df_samples$Injury== "pre-3xCHI" ~ InjPalette[3],
+  df_samples$Injury== "3xCHI" ~ InjPalette[4],
+  df_samples$Injury== "pre-5xCHI" ~ InjPalette[5],
+  df_samples$Injury== "5xCHI" ~ InjPalette[6])
+
+TimeColors = case_when(
+  df_samples$TimePoint== 0 ~ TimePalette[1],
+  df_samples$TimePoint== 0.5 ~ TimePalette[2],
+  df_samples$TimePoint== 4 ~ TimePalette[3],
+  df_samples$TimePoint== 24 ~ TimePalette[4],)
+
+barplot(rep(1,length(InjPalette)),col=InjPalette,names.arg = c("Sham","1xCHI","2xCHI","3xCHI","4xCHI","5xCHI"))
+barplot(rep(1,length(TimePalette)),col=TimePalette,names.arg = c("Pre-Injury","30min","4hr","24hr"))
+```
+
+#### Save protein data objects
+
+```{r protein_save}
+save(df_samples,analyte_range,greek,InjPalette,TimePalette,InjColors,TimeColors,file="R Data/proteins.rda") #  save to access later
+```
+
+### Load and save gene sets for gene set variation analysis (GSVA)
+
+Gene set variation analysis (GSVA) will be conducted on three collections: the C2 collection from the Molecular Signatures Database (MSigDB), custom curated annotations from astrocytes, and custom curated annotations from neurons.
+
+MSigDB: <https://www.gsea-msigdb.org/gsea/msigdb/human/collections.jsp>
+Custom Sets: <https://www.sciencedirect.com/science/article/pii/S0969996122000468>
+
+```{r gsva_load, eval=FALSE}
+# MSigDB c2
+geneSetsIn=readxl::read_excel("Reference Files/c2.cp.v7.0.symbols.xlsx",col_names=FALSE) %>%
+  dplyr::select(-2) %>%
+  t() 
+colnames(geneSetsIn) = geneSetsIn[1,]
+gs_MSigDB_C2 = geneSetsIn[-1,] %>%
+  as.data.frame() %>%
+  as.list() %>%
+  lapply(function(x) x[!is.na(x)])
+
+# Astrocyte Annotations
+gs_astro=readxl::read_excel("Reference Files/GeneSets_Astrocytes_FXN1.xlsx") %>%
+  as.list() %>%
+  lapply(function(x) x[!is.na(x)])
+
+# Neuron Annotations
+gs_neuron=readxl::read_excel("Reference Files/GeneSets_Neurons_FXN1.xlsx") %>%
+  as.list() %>%
+  lapply(function(x) x[!is.na(x)])
+
+save(gs_MSigDB_C2,gs_astro,gs_neuron,file="R Data/gs.rda")
+```
+```{r load_gs, include=FALSE}
+load("R Data/gs.rda")
+```
+
+```{r show_custom}
+glimpse(gs_astro)
+glimpse(gs_neuron)
+```
+
+
+### Normalization and variance stabilization with DESeq2
+
+#### Setup and load counts
+```{r DESeq2_setup}
+rm(list=ls())   # clears "workspace"
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))  # tells R that the folder where this code resides is our working directory
+load("R Data/genecounts.rda")
+```
+
+#### Normalization
+
+DESeq2 uses "median of ratios" method, as described here: <https://hbctraining.github.io/DGE_workshop/lessons/02_DGE_count_normalization.html>
+
+```{r DESeq2_norm, eval=FALSE}
+# DESeq2 Normalization 
+des_mat = count %>%
+  round(digits=0) %>%
+  as.matrix()
+metadata$AbsoluteTime=factor(metadata$AbsoluteTime)
+dds <- DESeq2::DESeqDataSetFromMatrix(countData = des_mat,
+                              colData = metadata,
+                              design = ~ AbsoluteTime)
+dds <- DESeq2::DESeq(dds)
+```
+
+#### Variance stabilizing transform
+
+VST is recommended for WGCNA: <https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/faq.html>
+
+VST in DESeq2: <http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#variance-stabilizing-transformation>
+
+```{r DESeq2_vst, eval=FALSE}
+# Variance Stabilizing Transform
+vsd <- DESeq2::getVarianceStabilizedData(dds)
+datExpr = t(vsd)
+
+cleanDat = vsd
+rownames(cleanDat) = str_c(gene.df$geneName,"|",rownames(vsd))
+
+save(datExpr,cleanDat,metadata,gene.df,file="R Data/geneVSD.rda")
 ```
 
